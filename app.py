@@ -9,15 +9,9 @@ import random
 from typing import List, Optional
 import requests
 from fastapi import FastAPI, Query, HTTPException
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tüm domainlere izin ver
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
 
 def normalize_text(s: str) -> str:
     import re
@@ -26,6 +20,7 @@ def normalize_text(s: str) -> str:
     s = s.replace("\n", " ").replace("\r", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 class Review(BaseModel):
     text: str
@@ -36,9 +31,11 @@ class Review(BaseModel):
     verified: Optional[bool] = None
     raw: dict = {}
 
+
 class HepsiburadaFetcher:
     BASE_URL = "https://www.hepsiburada.com/api/reviews"
-    def fetch_reviews(self, product_id: str, max_pages: Optional[int] = None, page_size:int=20) -> List[Review]:
+
+    def fetch_reviews(self, product_id: str, max_pages: Optional[int] = None, page_size: int = 20) -> List[Review]:
         all_reviews: List[Review] = []
         page = 1
         while True:
@@ -72,6 +69,7 @@ class HepsiburadaFetcher:
             time.sleep(random.uniform(0.4, 1.1))  # nazik tarama
         return all_reviews
 
+
 class SimpleSummarizer:
     def summarize(self, reviews: List[Review]) -> str:
         if not reviews:
@@ -82,10 +80,14 @@ class SimpleSummarizer:
         sents = re.split(r"(?<=[.!?…])\s+", joined)
         return " ".join(sents[:3])
 
+
+# ✅ FastAPI instance BURADA oluşturulmalı
 app = FastAPI(title="Hepsiburada Review Summarizer", version="1.0.0")
+
+# ✅ CORS ayarları BURADA eklenmeli
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tüm domainlere izin ver
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,9 +96,11 @@ app.add_middleware(
 fetcher = HepsiburadaFetcher()
 summarizer = SimpleSummarizer()
 
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
 
 @app.get("/summarize")
 def summarize(product_id: str = Query(..., description="Hepsiburada ürün ID (örn: HB00000XXX)"),
