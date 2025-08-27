@@ -6,7 +6,7 @@ app.use(express.json());
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Basit test endpointi
+// Test için kök endpoint
 app.get("/", (req, res) => {
   res.send("✅ Backend çalışıyor!");
 });
@@ -33,8 +33,8 @@ app.post("/summarize", async (req, res) => {
           { role: "system", content: "Sen Trendyol ürün yorumlarını özetleyen bir asistansın." },
           { role: "user", content: allText }
         ],
-        max_tokens: 500,  // güvenlik için ekledik
-        temperature: 0.3
+        temperature: 0.3,
+        max_tokens: 500
       })
     });
 
