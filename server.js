@@ -1,90 +1,137 @@
 import express from "express";
 import fetch from "node-fetch";
+import cors from "cors";
 
 const app = express();
-app.use(express.json());
+
+// CORS: popup.js'ten direkt çağrı için gerekli
+app.use(cors());
+app.use(express.json({ limit: "2mb" })); // büyük body'lerde güvenli limit
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// OpenAI çağrısı yapan yardımcı fonksiyon
+// Basit sağlık kontrolü
+app.get("/", (req, res) => res.send("OK"));
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Yardımcı: OpenAI çağrısı
 async function callOpenAI(prompt) {
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY tanımlı değil (Render → Environment Variables).");
+  }
+
+  const body = {
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "Sen Trendyol ürün yorumlarını özetleyen bir asistansın. Çıktıyı Türkçe, kısa ve maddeli ver. Olumlu/olumsuz/gönderi/kargo-ambalaj/genel tavsiye gibi ana başlıkları 6-8 maddeyi geçmeden özetle."
+      },
+      { role: "user", content: prompt }
+    ],
+    temperature: 0.3
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": `Bearer ${OPENAI_API_KEY}`
+      Authorization: `Bearer ${OPENAI_API_KEY}`
     },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: "Sen Trendyol ürün yorumlarını özetleyen bir asistansın. Özetinde olumlu yönler, olumsuz yönler ve genel kanaati kısaca belirt."
-        },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.3
-    })
+    body: JSON.stringify(body)
   });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`OpenAI API hatası: ${errText}`);
+  // OpenAI 422 gibi durumlarda buraya düşer
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => "");
+    throw new Error(`OpenAI ${resp.status}: ${detail}`);
   }
 
-  const data = await response.json();
-  return data?.choices?.[0]?.message?.content?.trim() || "Özet alınamadı.";
+  const data = await resp.json();
+  const text = data?.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("OpenAI yanıtı boş geldi.");
+  return text;
 }
 
-// Gruplama fonksiyonu
+// Dizi bölme
 function chunkArray(arr, size) {
-  const result = [];
-  for (let i = 0; i < arr.length; i += size) {
-    result.push(arr.slice(i, i + size));
-  }
-  return result;
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
 }
 
+// /summarize endpointi
 app.post("/summarize", async (req, res) => {
   try {
-    let { reviews } = req.body;
+    let reviews = [];
+    const body = req.body || {};
 
-    if (!reviews || !Array.isArray(reviews)) {
-      return res.status(400).json({ error: "reviews alanı gerekli ve array olmalı" });
+    // 1) Gelen veriyi normalize et: {reviews:[{text:"..."}, ...]} | {reviews:["...","..."]} | {text:"..."}
+    if (Array.isArray(body.reviews)) {
+      reviews = body.reviews
+        .map((r) => (typeof r === "string" ? r : r?.text))
+        .filter((t) => typeof t === "string" && t.trim().length > 0);
+    } else if (typeof body.text === "string") {
+      reviews = [body.text];
     }
 
-    // Eğer string array gelirse objeye dönüştür
-    if (reviews.length > 0 && typeof reviews[0] === "string") {
-      reviews = reviews.map(t => ({ text: t }));
+    if (!reviews.length) {
+      return res.status(400).json({
+        error: "Geçerli yorum verisi gönderilmedi.",
+        expect: { reviews: [{ text: "metin" }, { text: "metin" }] }
+      });
     }
 
-    // Boş yorum kontrolü
-    if (reviews.length === 0) {
-      return res.status(400).json({ error: "Yorumlar boş" });
+    // 2) Çok uzun yorumları kes (ör. her birini max 300 karakter)
+    const cleaned = reviews.map((t) => t.trim().slice(0, 300)).filter(Boolean);
+
+    // 3) Toplam karakteri mantıklı parçalara ayır (mesaj başına ~5.5k char hedefleyelim)
+    // 30 yorum/5500 karakter sınırı → token limitine güvenli yaklaşım
+    const chunks = [];
+    let current = [];
+    let currentLen = 0;
+    for (const t of cleaned) {
+      if (current.length >= 30 || currentLen + t.length > 5500) {
+        chunks.push(current.join("\n"));
+        current = [t];
+        currentLen = t.length;
+      } else {
+        current.push(t);
+        currentLen += t.length;
+      }
+    }
+    if (current.length) chunks.push(current.join("\n"));
+
+    // 4) Her parça için kısmi özet al
+    const partials = [];
+    for (const [i, chunk] of chunks.entries()) {
+      const prompt =
+        `Aşağıda kullanıcı yorumları (parça ${i + 1}/${chunks.length}) var:\n\n${chunk}\n\n` +
+        `Görev: Bu parçanın kısa maddeler halinde özetini çıkar.`;
+      const partSummary = await callOpenAI(prompt);
+      partials.push(partSummary);
     }
 
-    // 1) Yorumları 50'şer parçaya böl
-    const chunks = chunkArray(reviews, 50);
+    // 5) Kısmi özetlerden genel özet al
+    const finalPrompt =
+      "Aşağıda bir ürünün kullanıcı yorumlarından elde edilmiş kısmi özetler var. " +
+      "Bunları birleştirerek tekrar eden noktaları gruplayıp, 6-8 maddelik net ve tarafsız bir nihai özet yaz. " +
+      "Olumlu/olumsuz yönler, kalite/uyumluluk, kargo/paketleme ve satın alma tavsiyesi mutlaka yer alsın.\n\n" +
+      partials.join("\n\n");
+    const finalSummary = await callOpenAI(finalPrompt);
 
-    // 2) Her parça için özet al
-    const partialSummaries = [];
-    for (const chunk of chunks) {
-      const text = chunk.map(r => r.text).join("\n");
-      const summary = await callOpenAI(text);
-      partialSummaries.push(summary);
-    }
-
-    // 3) Tüm özetleri birleştirip genel özet al
-    const finalSummary = await callOpenAI(
-      "Aşağıda parçalı özetler var, bunlardan genel bir özet çıkar:\n\n" +
-      partialSummaries.join("\n\n")
-    );
-
-    res.json({ summary: finalSummary });
-
+    res.json({ summary: finalSummary, parts: chunks.length });
   } catch (err) {
-    console.error("Backend hata:", err);
-    res.status(500).json({ error: "Bir hata oluştu", detail: err.message });
+    // Burada 422’yi içeri gömüp anlaşılır mesaj döndürüyoruz
+    console.error("Backend error:", err);
+    return res.status(400).json({
+      error: "Özetleme isteği işlenemedi.",
+      hint:
+        "Genelde çok uzun/boş içerik veya geçersiz format yüzünden olur. " +
+        "Gönderilen body: { reviews: [{text:'...'}] } şeklinde olmalı.",
+      detail: String(err.message || err)
+    });
   }
 });
 
