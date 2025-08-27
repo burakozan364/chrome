@@ -4,70 +4,105 @@ import cors from "cors";
 
 const app = express();
 
-// CORS: popup.js'ten direkt çağrı için gerekli
+// CORS: Chrome extension doğrudan çağırabilsin
 app.use(cors());
-app.use(express.json({ limit: "2mb" })); // büyük body'lerde güvenli limit
+app.use(express.json({ limit: "2mb" }));
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-// Basit sağlık kontrolü
-app.get("/", (req, res) => res.send("OK"));
-app.get("/health", (req, res) => res.json({ ok: true }));
+// Basit sağlık
+app.get("/", (_, res) => res.send("OK"));
+app.get("/health", (_, res) => res.json({ ok: true }));
 
-// Yardımcı: OpenAI çağrısı
-async function callOpenAI(prompt) {
+// --- Yardımcılar ---
+
+// Güvenli parçalayıcı (char bazında toplama limiti + max eleman)
+function chunkTexts(texts, maxItems = 30, maxChars = 5500) {
+  const chunks = [];
+  let bucket = [];
+  let chars = 0;
+  for (const t of texts) {
+    const s = (t || "").trim().slice(0, 300); // tek yorum 300 char ile sınırla
+    if (!s) continue;
+    if (bucket.length >= maxItems || chars + s.length > maxChars) {
+      if (bucket.length) chunks.push(bucket.join("\n"));
+      bucket = [s];
+      chars = s.length;
+    } else {
+      bucket.push(s);
+      chars += s.length;
+    }
+  }
+  if (bucket.length) chunks.push(bucket.join("\n"));
+  return chunks;
+}
+
+// OpenAI'ya güvenli çağrı + model fallback
+async function callOpenAIWithFallback(prompt) {
   if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY tanımlı değil (Render → Environment Variables).");
+    throw { status: 500, message: "OPENAI_API_KEY tanımlı değil. Render → Environment Variables." };
   }
 
-  const body = {
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content:
-          "Sen Trendyol ürün yorumlarını özetleyen bir asistansın. Çıktıyı Türkçe, kısa ve maddeli ver. Olumlu/olumsuz/gönderi/kargo-ambalaj/genel tavsiye gibi ana başlıkları 6-8 maddeyi geçmeden özetle."
-      },
-      { role: "user", content: prompt }
-    ],
-    temperature: 0.3
-  };
+  const tryModels = [
+    "gpt-4o-mini",
+    "gpt-3.5-turbo" // fallback: çoğu hesapta açıktır
+  ];
 
-  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`
-    },
-    body: JSON.stringify(body)
-  });
+  let lastErr = null;
+  for (const model of tryModels) {
+    try {
+      const body = {
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Sen Trendyol ürün yorumlarını özetleyen bir asistansın. Çıktıyı Türkçe ve kısa, 6–8 madde olarak ver. Olumlu/olumsuz yönler, kalite/uyumluluk, kargo/paketleme ve satın alma tavsiyesi mutlaka yer alsın."
+          },
+          { role: "user", content: prompt }
+        ],
+        temperature: 0.3
+      };
 
-  // OpenAI 422 gibi durumlarda buraya düşer
-  if (!resp.ok) {
-    const detail = await resp.text().catch(() => "");
-    throw new Error(`OpenAI ${resp.status}: ${detail}`);
+      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENAI_API_KEY}`
+        },
+        body: JSON.stringify(body)
+      });
+
+      if (!resp.ok) {
+        // OpenAI 4xx/5xx → ayrıntıyı çıkar
+        let detail = await resp.text().catch(() => "");
+        // Denen modelin hatasını sakla; sonraki modele geç
+        lastErr = { status: resp.status, message: `OpenAI ${resp.status} (${model}): ${detail}` };
+        continue;
+      }
+
+      const data = await resp.json();
+      const text = data?.choices?.[0]?.message?.content?.trim();
+      if (!text) throw { status: 500, message: `OpenAI yanıtı boş (${model}).` };
+      return text;
+    } catch (e) {
+      lastErr = { status: e.status || 500, message: e.message || String(e) };
+      // sonraki modele devam
+    }
   }
-
-  const data = await resp.json();
-  const text = data?.choices?.[0]?.message?.content?.trim();
-  if (!text) throw new Error("OpenAI yanıtı boş geldi.");
-  return text;
+  // Tüm modeller başarısızsa son hatayı fırlat
+  throw lastErr || { status: 500, message: "OpenAI isteği başarısız." };
 }
 
-// Dizi bölme
-function chunkArray(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
-}
+// --- Endpoint ---
 
-// /summarize endpointi
 app.post("/summarize", async (req, res) => {
   try {
-    let reviews = [];
     const body = req.body || {};
+    let reviews = [];
 
-    // 1) Gelen veriyi normalize et: {reviews:[{text:"..."}, ...]} | {reviews:["...","..."]} | {text:"..."}
+    // İzin verilen giriş biçimleri:
+    // { reviews: [{text:"..."}, ...] }  |  { reviews: ["...", "..."] }  |  { text: "..." }
     if (Array.isArray(body.reviews)) {
       reviews = body.reviews
         .map((r) => (typeof r === "string" ? r : r?.text))
@@ -79,61 +114,47 @@ app.post("/summarize", async (req, res) => {
     if (!reviews.length) {
       return res.status(400).json({
         error: "Geçerli yorum verisi gönderilmedi.",
-        expect: { reviews: [{ text: "metin" }, { text: "metin" }] }
+        expect: { reviews: [{ text: "..." }, { text: "..." }] }
       });
     }
 
-    // 2) Çok uzun yorumları kes (ör. her birini max 300 karakter)
-    const cleaned = reviews.map((t) => t.trim().slice(0, 300)).filter(Boolean);
-
-    // 3) Toplam karakteri mantıklı parçalara ayır (mesaj başına ~5.5k char hedefleyelim)
-    // 30 yorum/5500 karakter sınırı → token limitine güvenli yaklaşım
-    const chunks = [];
-    let current = [];
-    let currentLen = 0;
-    for (const t of cleaned) {
-      if (current.length >= 30 || currentLen + t.length > 5500) {
-        chunks.push(current.join("\n"));
-        current = [t];
-        currentLen = t.length;
-      } else {
-        current.push(t);
-        currentLen += t.length;
-      }
+    // Parçalara böl
+    const parts = chunkTexts(reviews, 30, 5500);
+    if (!parts.length) {
+      return res.status(400).json({ error: "Gönderilen yorumlar boş görünüyor." });
     }
-    if (current.length) chunks.push(current.join("\n"));
 
-    // 4) Her parça için kısmi özet al
+    // Parça özetleri
     const partials = [];
-    for (const [i, chunk] of chunks.entries()) {
+    for (let i = 0; i < parts.length; i++) {
       const prompt =
-        `Aşağıda kullanıcı yorumları (parça ${i + 1}/${chunks.length}) var:\n\n${chunk}\n\n` +
-        `Görev: Bu parçanın kısa maddeler halinde özetini çıkar.`;
-      const partSummary = await callOpenAI(prompt);
-      partials.push(partSummary);
+        `Aşağıda kullanıcı yorumları (parça ${i + 1}/${parts.length}) var:\n\n${parts[i]}\n\n` +
+        `Görev: Bu parçayı Türkçe, 6 maddeyi geçmeden kısa ve net özetle.`;
+      const summary = await callOpenAIWithFallback(prompt);
+      partials.push(summary);
     }
 
-    // 5) Kısmi özetlerden genel özet al
+    // Final özet
     const finalPrompt =
-      "Aşağıda bir ürünün kullanıcı yorumlarından elde edilmiş kısmi özetler var. " +
-      "Bunları birleştirerek tekrar eden noktaları gruplayıp, 6-8 maddelik net ve tarafsız bir nihai özet yaz. " +
+      "Aşağıda bir ürünün kullanıcı yorumlarına ait parça özetleri var. " +
+      "Tekrarlayan noktaları gruplayıp, 6–8 maddelik nihai bir özet yaz. " +
       "Olumlu/olumsuz yönler, kalite/uyumluluk, kargo/paketleme ve satın alma tavsiyesi mutlaka yer alsın.\n\n" +
       partials.join("\n\n");
-    const finalSummary = await callOpenAI(finalPrompt);
+    const finalSummary = await callOpenAIWithFallback(finalPrompt);
 
-    res.json({ summary: finalSummary, parts: chunks.length });
+    res.json({ summary: finalSummary, parts: parts.length });
   } catch (err) {
-    // Burada 422’yi içeri gömüp anlaşılır mesaj döndürüyoruz
-    console.error("Backend error:", err);
-    return res.status(400).json({
-      error: "Özetleme isteği işlenemedi.",
-      hint:
-        "Genelde çok uzun/boş içerik veya geçersiz format yüzünden olur. " +
-        "Gönderilen body: { reviews: [{text:'...'}] } şeklinde olmalı.",
-      detail: String(err.message || err)
+    // Burada upstream status’u koruyup ayrıntıyı döndürüyoruz (422 dahil)
+    const status = err?.status || 500;
+    const message = err?.message || "Bilinmeyen hata";
+    console.error("✖ summarize error:", status, message);
+    res.status(status).json({
+      error: "Özetleme başarısız",
+      detail: message
     });
   }
 });
 
+// Sunucu
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`✅ Server ${port} portunda çalışıyor`));
